@@ -301,6 +301,30 @@ async fn handle_command(command: ShellCommand, client: &Client) -> Result<()> {
                 }
             } else {
                 // Query relays
+                println!("Querying relays...");
+                
+                let now = Instant::now();
+                
+                // Get events from relays
+                let events = client
+                    .fetch_events(filter, Duration::from_secs(10))
+                    .await?;
+                
+                let duration = now.elapsed();
+                println!(
+                    "{} results in {}",
+                    events.len(),
+                    if duration.as_secs() == 0 {
+                        format!("{:.6} ms", duration.as_secs_f64() * 1000.0)
+                    } else {
+                        format!("{:.2} sec", duration.as_secs_f64())
+                    }
+                );
+                
+                if print {
+                    // Print events
+                    util::print_events(events, json);
+                }
             }
 
             Ok(())
@@ -353,6 +377,199 @@ async fn handle_command(command: ShellCommand, client: &Client) -> Result<()> {
                 println!("TODO");
                 Ok(())
             }
+        },
+        ShellCommand::Dvm {
+            pubkey,
+            param,
+            content,
+            max_results,
+            timeout,
+            print,
+            json,
+        } => {
+            println!("Sending DVM request to {}...", pubkey);
+            
+            // Create and send DVM request event (kind 5300)
+            let keys = io::get_keys("Your Keys")?;
+            
+            let mut event_builder = EventBuilder::new(Kind::Custom(5300), content)
+                .tag(Tag::public_key(pubkey))
+                .tag(Tag::parse(vec!["alt", "NIP90 Content Discovery Request"])?)
+                .tag(Tag::parse(vec!["param", "max_results", &max_results.to_string()])?);
+            
+            // Add custom parameters
+            for p in param {
+                if let Some((key, value)) = p.split_once('=') {
+                    event_builder = event_builder.tag(Tag::parse(vec!["param", key, value])?);
+                }
+            }
+            
+            // Add relay information
+            let connected_relays: Vec<String> = client.relays().await.keys().map(|url| url.to_string()).collect();
+            if !connected_relays.is_empty() {
+                let mut relay_vec = vec!["relays"];
+                relay_vec.extend(connected_relays.iter().map(|s| s.as_str()));
+                event_builder = event_builder.tag(Tag::parse(relay_vec)?);
+            }
+            
+            let event = event_builder.sign_with_keys(&keys)?;
+            
+            println!("Request event ID: {}", event.id);
+            println!("Request content: '{}'", event.content);
+            println!("Request tags:");
+            for tag in event.tags.iter() {
+                println!("  {:?}", tag);
+            }
+            
+            // Send the request
+            client.send_event(&event).await?;
+            
+            // Wait for DVM response with timeout
+            println!("Waiting for DVM response...");
+            
+            let mut found_responses = 0;
+            let start_time = Instant::now();
+            let timeout_duration = Duration::from_secs(timeout);
+            let max_attempts = ((timeout + 4) / 5) as u32; // Attempt every 5 seconds
+            
+            for attempt in 1..=max_attempts {
+                if start_time.elapsed() >= timeout_duration {
+                    println!("Timeout reached after {} seconds", timeout);
+                    break;
+                }
+                
+                println!("Checking for responses (attempt {}/{})...", attempt, max_attempts);
+                
+                // Wait a bit before each check (but respect timeout)
+                let wait_time = if attempt == 1 { 3 } else { 5 };
+                let remaining_time = timeout_duration.saturating_sub(start_time.elapsed());
+                let actual_wait = Duration::from_secs(wait_time).min(remaining_time);
+                
+                if actual_wait > Duration::ZERO {
+                    tokio::time::sleep(actual_wait).await;
+                }
+                
+                // Check for responses that reference our request event ID  
+                // Use the exact same filter construction as the working manual query
+                let response_filter = Filter::new()
+                    .kind(Kind::Custom(6300))
+                    .author(pubkey)  // Changed from .pubkey() to .author()
+                    .limit(10);
+                
+                println!("Querying relays directly...");
+                
+                // Try to get events from relays (similar to query --relay)
+                let response_events = client
+                    .fetch_events(response_filter.clone(), Duration::from_secs(10))
+                    .await?;
+                
+                println!("Found {} total response events from this DVM", response_events.len());
+                
+                // If no events found, try querying the database too
+                if response_events.is_empty() {
+                    println!("No events from relays, trying database...");
+                    let db_events = client.database().query(response_filter).await?;
+                    println!("Found {} events in database", db_events.len());
+                    
+                    // Process database events
+                    for response in db_events.into_iter() {
+                        let is_our_response = response.tags.iter().any(|tag| {
+                            if let Some(TagStandard::Event { event_id, .. }) = tag.as_standardized() {
+                                return *event_id == event.id;
+                            }
+                            false
+                        });
+                        
+                        if is_our_response {
+                            found_responses += 1;
+                            println!("🎉 Found matching response in database #{}!", found_responses);
+                            println!("Response created at: {}", response.created_at.to_human_datetime());
+                            println!("Response ID: {}", response.id);
+                            
+                            if print {
+                                if json {
+                                    println!("Response: {}", response.as_pretty_json());
+                                } else {
+                                    println!("Content length: {} characters", response.content.len());
+                                    
+                                    // Try to parse content as event IDs
+                                    if let Ok(content_json) = serde_json::from_str::<Vec<Vec<String>>>(&response.content) {
+                                        println!("📋 Event IDs from DVM ({} total):", content_json.len());
+                                        for (i, tag) in content_json.iter().enumerate() {
+                                            if tag.len() == 2 && tag[0] == "e" {
+                                                println!("  {}. {}", i + 1, tag[1]);
+                                            }
+                                        }
+                                    } else {
+                                        println!("Content preview: {}", response.content.chars().take(200).collect::<String>());
+                                    }
+                                }
+                            }
+                            
+                            // Found our response, we can exit
+                            break;
+                        }
+                    }
+                } else {
+                    // Process relay events
+                    for response in response_events.into_iter() {
+                        let is_our_response = response.tags.iter().any(|tag| {
+                            if let Some(TagStandard::Event { event_id, .. }) = tag.as_standardized() {
+                                return *event_id == event.id;
+                            }
+                            false
+                        });
+                        
+                        if is_our_response {
+                            found_responses += 1;
+                            println!("🎉 Found matching response #{}!", found_responses);
+                            println!("Response created at: {}", response.created_at.to_human_datetime());
+                            println!("Response ID: {}", response.id);
+                            
+                            if print {
+                                if json {
+                                    println!("Response: {}", response.as_pretty_json());
+                                } else {
+                                    println!("Content length: {} characters", response.content.len());
+                                    
+                                    // Try to parse content as event IDs
+                                    if let Ok(content_json) = serde_json::from_str::<Vec<Vec<String>>>(&response.content) {
+                                        println!("📋 Event IDs from DVM ({} total):", content_json.len());
+                                        for (i, tag) in content_json.iter().enumerate() {
+                                            if tag.len() == 2 && tag[0] == "e" {
+                                                println!("  {}. {}", i + 1, tag[1]);
+                                            }
+                                        }
+                                    } else {
+                                        println!("Content preview: {}", response.content.chars().take(200).collect::<String>());
+                                    }
+                                }
+                            }
+                            
+                            // Found our response, we can exit
+                            break;
+                        }
+                    }
+                }
+                
+                if found_responses > 0 {
+                    break; // Found what we were looking for
+                }
+                
+                if attempt < max_attempts {
+                    println!("No matching responses yet, waiting...");
+                }
+            }
+            
+            if found_responses > 0 {
+                println!("✅ Successfully received {} response(s) from DVM!", found_responses);
+            } else {
+                println!("❌ No responses found after {} seconds.", timeout);
+                println!("You can manually check for responses with:");
+                println!("query --kind 6300 --author {} --limit 5 --relay --print --json", pubkey);
+            }
+            
+            Ok(())
         },
         ShellCommand::Exit => std::process::exit(0x01),
     }

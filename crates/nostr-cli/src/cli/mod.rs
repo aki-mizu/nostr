@@ -99,6 +99,31 @@ pub enum ShellCommand {
         #[command(subcommand)]
         command: ShellCommandDatabase,
     },
+    /// DVM (Data Vending Machine) request
+    #[command(arg_required_else_help = true)]
+    Dvm {
+        /// DVM public key
+        #[clap(short, long)]
+        pubkey: PublicKey,
+        /// Parameters (key=value format)
+        #[clap(long)]
+        param: Vec<String>,
+        /// Content for the request
+        #[clap(short, long, default_value = "")]
+        content: String,
+        /// Maximum results
+        #[clap(long, default_value = "50")]
+        max_results: usize,
+        /// Timeout in seconds
+        #[clap(short, long, default_value = "10")]
+        timeout: u64,
+        /// Print response events
+        #[clap(long)]
+        print: bool,
+        /// Print response as JSON
+        #[clap(long)]
+        json: bool,
+    },
     /// Exit
     Exit,
 }
