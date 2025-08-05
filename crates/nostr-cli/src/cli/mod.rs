@@ -124,6 +124,19 @@ pub enum ShellCommand {
         #[clap(long)]
         json: bool,
     },
+    /// Show user's relay list (NIP-65)  
+    #[command(name = "relay-list", arg_required_else_help = true)]
+    RelayList {
+        /// User's public key
+        #[clap(short, long)]
+        pubkey: PublicKey,
+        /// Query only database
+        #[clap(long)]
+        database: bool,
+        /// Print raw event as JSON
+        #[clap(long)]
+        json: bool,
+    },
     /// Exit
     Exit,
 }

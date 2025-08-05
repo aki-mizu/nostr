@@ -571,8 +571,96 @@ async fn handle_command(command: ShellCommand, client: &Client) -> Result<()> {
             
             Ok(())
         },
+        ShellCommand::RelayList { pubkey, database, json } => {
+            if database {
+                let db = client.database();
+                let filter = Filter::new()
+                    .author(pubkey)
+                    .kind(Kind::RelayList)
+                    .limit(1);
+                
+                let events = db.query(filter).await?;
+                
+                if events.is_empty() {
+                    println!("No relay list found for user {} in database", pubkey);
+                } else {
+                    let event = events.into_iter().next().unwrap();
+                    print_relay_list(&event, json);
+                }
+            } else {
+                println!("Querying relays for user's relay list...");
+                
+                let filter = Filter::new()
+                    .author(pubkey)
+                    .kind(Kind::RelayList)
+                    .limit(1);
+                
+                let events = client
+                    .fetch_events(filter, Duration::from_secs(10))
+                    .await?;
+                
+                if events.is_empty() {
+                    println!("No relay list found for user {}", pubkey);
+                } else {
+                    let event = events.into_iter().next().unwrap();
+                    print_relay_list(&event, json);
+                }
+            }
+            
+            Ok(())
+        },
         ShellCommand::Exit => std::process::exit(0x01),
     }
+}
+
+fn print_relay_list(event: &Event, json: bool) {
+    use nostr_sdk::nips::nip65::extract_relay_list;
+    
+    if json {
+        println!("{}", event.as_pretty_json());
+        return;
+    }
+    
+    println!("📡 Relay List for {}", event.pubkey);
+    println!("Created: {}", event.created_at.to_human_datetime());
+    println!("Event ID: {}", event.id);
+    
+    let mut read_relays = Vec::new();
+    let mut write_relays = Vec::new();
+    let mut readwrite_relays = Vec::new();
+    
+    for (relay_url, metadata) in extract_relay_list(event) {
+        match metadata {
+            Some(RelayMetadata::Read) => read_relays.push(relay_url),
+            Some(RelayMetadata::Write) => write_relays.push(relay_url),
+            None => readwrite_relays.push(relay_url),
+        }
+    }
+    
+    let total_relays = readwrite_relays.len() + read_relays.len() + write_relays.len();
+    
+    if !readwrite_relays.is_empty() {
+        println!("\n🔄 Read/Write Relays ({}):", readwrite_relays.len());
+        for relay in &readwrite_relays {
+            println!("  • {}", relay);
+        }
+    }
+    
+    if !read_relays.is_empty() {
+        println!("\n📖 Read Relays ({}):", read_relays.len());
+        for relay in &read_relays {
+            println!("  • {}", relay);
+        }
+    }
+    
+    if !write_relays.is_empty() {
+        println!("\n✍️  Write Relays ({}):", write_relays.len());
+        for relay in &write_relays {
+            println!("  • {}", relay);
+        }
+    }
+    
+    println!("\nTotal relays: {}", total_relays);
 }
 
 struct CustomActions;
